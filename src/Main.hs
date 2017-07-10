@@ -197,7 +197,7 @@ instance FromJSON Events
 ----------------------------------------------------------------------
 
 dbConnection :: Text
-dbConnection = ":memory:"
+dbConnection = "events.db"
 
 main :: IO ()
 main = do

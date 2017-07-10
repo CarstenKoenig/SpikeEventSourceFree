@@ -1,13 +1,19 @@
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE ExistentialQuantification #-}
-{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE GADTs,ExistentialQuantification #-}
+{-# LANGUAGE DeriveFunctor, DeriveGeneric #-}
+-- jup Persist needs quite some things
+{-# LANGUAGE TemplateHaskell, QuasiQuotes, TypeFamilies, MultiParamTypeClasses, GeneralizedNewtypeDeriving #-}
 
 module Main where
 
 import           Control.Monad.Free (Free)
 import qualified Control.Monad.Free as MF
 
+import           Control.Monad.Logger (NoLoggingT)
+
 import           Control.Monad.Trans.Class (lift)
+import           Control.Monad.Trans.Reader (ReaderT)
+import           Control.Monad.Trans.Resource (ResourceT)
 
 import           Control.Monad.Trans.State.Strict (StateT)
 import qualified Control.Monad.Trans.State.Strict as State
@@ -15,7 +21,21 @@ import qualified Control.Monad.Trans.State.Strict as State
 import           Control.Monad.Trans.Writer.Strict (Writer)
 import qualified Control.Monad.Trans.Writer.Strict as Writer
 
-import Data.List (foldl')
+import           Data.Aeson (ToJSON(..),FromJSON(..))
+import qualified Data.Aeson as Json
+import           Data.ByteString (ByteString)
+import qualified Data.ByteString.Lazy as LBS
+import           Data.List (foldl')
+import           Data.Maybe (mapMaybe)
+import           Data.Text (Text)
+
+import           Database.Persist.TH (share, persistLowerCase
+                                     , mkPersist, mkMigrate, sqlSettings)
+import           Database.Persist.Sql (runMigration, SqlBackend)
+import qualified Database.Persist.Sql as Sql
+import           Database.Persist.Sqlite (runSqlite)
+
+import           GHC.Generics
 
 
 type EventStream ev = Free (EventStreamF ev)
@@ -55,19 +75,15 @@ instance Functor (Projection ev) where
 
 type MemoryStore ev = StateT [ev] (Writer [String])
 
+
 runInMemory :: Show ev => [ev] -> EventStream ev res -> (res, [String])
 runInMemory events = Writer.runWriter . flip State.evalStateT events . inMemory
+  where
+    inMemory = MF.iterM interpretMemory
 
 
-execInMemory :: Show ev => [ev] -> EventStream ev res -> ([ev], [String])
-execInMemory events = Writer.runWriter . flip State.execStateT events . inMemory
-
-
-inMemory :: Show ev => EventStream ev res -> MemoryStore ev res
-inMemory = MF.iterM interpretMemory
-
-
-interpretMemory :: Show ev => EventStreamF ev (MemoryStore ev res) -> MemoryStore ev res
+interpretMemory :: Show ev =>
+                   EventStreamF ev (MemoryStore ev res) -> MemoryStore ev res
 interpretMemory (AddEvent ev mem) = do
   lift (Writer.tell ["adding Event " ++ show ev])
   State.withStateT (ev :) mem
@@ -78,12 +94,48 @@ interpretMemory (Project (Projection i fd fi)) = do
 
 
 ----------------------------------------------------------------------
+-- interpret using a Persistent-Sqlite database
+
+type SqliteStore ev = ReaderT SqlBackend (NoLoggingT (ResourceT IO))
+
+
+share [mkPersist sqlSettings, mkMigrate "migrateAll"] [persistLowerCase|
+Event
+    json ByteString
+    deriving Show
+|]
+
+
+runInSqlite :: (ToJSON ev, FromJSON ev) => Text -> EventStream ev res -> IO res
+runInSqlite connection query = do
+  runSqlite connection $ do
+    runMigration migrateAll
+    inSqlite query
+  where
+    inSqlite = MF.iterM interpretPersitent
+
+
+interpretPersitent :: (ToJSON ev, FromJSON ev) =>
+                      EventStreamF ev (SqliteStore ev res) -> SqliteStore ev res
+interpretPersitent (AddEvent ev query) = do
+  Sql.insert $ Event (LBS.toStrict $ Json.encode ev)
+  query
+interpretPersitent (Project (Projection i fd fi)) = do
+  events <- mapMaybe rowToEv <$> Sql.selectList [] []
+  fi (foldl' fd i events)
+  where
+    rowToEv =  decodeJson . eventJson . Sql.entityVal
+    decodeJson = Json.decode . LBS.fromStrict
+
+
+
+----------------------------------------------------------------------
 -- Example
 
 data Events
   = NameSet String
   | AgeSet Int
-  deriving Show
+  deriving (Generic, Show)
 
 
 data Person
@@ -104,9 +156,22 @@ example = do
   addEvent $ NameSet "Carsten"
   addEvent $ AgeSet 37
   project personP
-  
+
 
 ----------------------------------------------------------------------
+-- infrastructure
+
+-- Events should be serializable to JSON
+
+instance ToJSON Events where
+    toEncoding = Json.genericToEncoding Json.defaultOptions
+
+instance FromJSON Events
+
+----------------------------------------------------------------------
+
+dbConnection :: Text
+dbConnection = ":memory:"
 
 main :: IO ()
 main = do
@@ -114,3 +179,8 @@ main = do
   putStrLn "Log:"
   putStrLn $ unlines log
   putStrLn $ "\nResult:\n" ++ show result
+  
+  putStrLn "\n\n========\n\n"
+
+  putStrLn "SQLite:"
+  runInSqlite dbConnection example >>= print
